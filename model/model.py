@@ -447,7 +447,7 @@ class MiniMindBlock(nn.Module):
 		position_embeddings: tuple[torch.Tensor, torch.Tensor],
 		past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
 		use_cache: bool = False,
-		attaention_mask: torch.Tensor | None = None,
+		attention_mask: torch.Tensor | None = None,
 	) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
 		# 注意力层
 		residual = hidden_states
@@ -456,7 +456,7 @@ class MiniMindBlock(nn.Module):
 			position_embeddings,
 			past_key_value,
 			use_cache,
-			attaention_mask,
+			attention_mask,
 		)
 		hidden_states = hidden_states + residual
 
@@ -464,3 +464,67 @@ class MiniMindBlock(nn.Module):
 		hidden_states = hidden_states + self.mlp(hidden_states)
 
 		return hidden_states, past_key_value
+
+
+class MiniMindModel(nn.Module):
+	def __init__(self, config: MiniMindConfig) -> None:
+		super().__init__()
+		self.config = config
+		self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+		self.dropout = nn.Dropout(config.dropout)
+		self.layers  = nn.ModuleList(
+			[MiniMindBlock(i, config) for i in range(config.num_hidden_layers)]
+		)
+		self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		freqs_cos, freqs_sin = precompute_freqs_cis(
+			dim=config.hidden_size // config.num_attention_heads,
+			end=config.max_position_embeddings,
+			rope_base=config.rope_theta,
+			rope_scaling=config.rope_scaling,
+		)
+		self.freqs_cos : torch.Tensor
+		self.freqs_sin : torch.Tensor
+		self.register_buffer('freqs_cos', freqs_cos, persistent=False)
+		self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+
+	def forward(
+		self,
+		input_ids: torch.Tensor | None = None,
+		attention_mask: torch.Tensor | None = None,
+		past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+		use_cache: bool = False,
+		**kwargs,
+	) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]] | None, torch.Tensor | float]:
+		assert input_ids is not None, 'input_ids must be provided'
+		batch_size, seq_len = input_ids.shape
+		if hasattr(past_key_values, 'layers'):
+			past_key_values = None
+		past_key_values_list = past_key_values or [None] * len(self.layers)
+		start_pos = (
+			past_key_values_list[0][0].shape[1] if past_key_values_list[0] is not None else 0
+		)
+
+		hidden_states = self.dropout(self.embed_tokens(input_ids))
+		position_embeddings = (
+			self.freqs_cos[start_pos : start_pos + seq_len],
+			self.freqs_sin[start_pos : start_pos + seq_len],
+		)
+
+		persents = []
+		for layer, past_key_value in zip(self.layers, past_key_values_list, strict=False):
+			hidden_states, present = layer(
+				hidden_states,
+				position_embeddings,
+				past_key_value,
+				use_cache,
+				attention_mask,
+			)
+			persents.append(present)
+		hidden_states = self.norm(hidden_states)
+
+		aux_loss = sum(
+			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)], # type: ignore
+			hidden_states.new_zeros(1).squeeze(),
+		) # type: ignore
+		return hidden_states, persents, aux_loss
