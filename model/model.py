@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -39,7 +40,7 @@ class MiniMindConfig(PretrainedConfig):
 		seq_aux: bool = True,
 		norm_topk_prob: bool = True,
 		**kwargs,
-	):
+	) -> None:
 		super().__init__(**kwargs)
 		self.dropout = dropout
 		self.bos_token_id = bos_token_id
@@ -84,22 +85,22 @@ class MiniMindConfig(PretrainedConfig):
 
 
 class RMSNorm(torch.nn.Module):
-	def __init__(self, dim: int, eps: float = 1e-5):
+	def __init__(self, dim: int, eps: float = 1e-5) -> None:
 		super().__init__()
 		self.eps = eps
 		self.dim = dim
 		self.weight = torch.nn.Parameter(torch.ones(dim))
 
-	def _norm(self, x: torch.Tensor):
+	def _norm(self, x: torch.Tensor) -> torch.Tensor:
 		return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-	def forward(self, x: torch.Tensor):
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		return self.weight * self._norm(x.float()).type_as(x)
 
 
 def precompute_freqs_cis(
 	dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict | None = None
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
 	freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
 	attn_factor = 1.0
 	if rope_scaling is not None:
@@ -132,8 +133,10 @@ def precompute_freqs_cis(
 	return freqs_cos, freqs_sin
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-	def rotate_half(x):
+def apply_rotary_pos_emb(
+	q, k, cos, sin, position_ids=None, unsqueeze_dim=1
+) -> tuple[torch.Tensor, torch.Tensor]:
+	def rotate_half(x) -> torch.Tensor:
 		return torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
 
 	q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
@@ -142,8 +145,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-	assert n_rep > 0, f"n_rep must be a positive integer, but got {n_rep}"
-	assert len(x.shape) == 4, f"x must be a 4-D tensor, but got {x.shape}"
+	assert n_rep > 0, f'n_rep must be a positive integer, but got {n_rep}'
+	assert len(x.shape) == 4, f'x must be a 4-D tensor, but got {x.shape}'
 	batch_size, seq_len, num_head, head_dim = x.shape
 	if n_rep == 1:
 		return x
@@ -155,33 +158,37 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-	def __init__(self, args: MiniMindConfig):
+	def __init__(self, config: MiniMindConfig) -> None:
 		super().__init__()
-		self.num_key_value_heads = args.num_attention_heads \
-			if args.num_key_value_heads is None else args.num_key_value_heads
-		assert args.num_attention_heads % args.num_key_value_heads == 0, \
-			f"num_attention_heads must be divisible by num_key_value_heads, " \
-			f"but got {args.num_attention_heads} and {args.num_key_value_heads}"
-		self.n_local_heads = args.num_attention_heads
-		self.n_local_kv_heads = args.num_key_value_heads
+		self.num_key_value_heads = (
+			config.num_attention_heads
+			if config.num_key_value_heads is None
+			else config.num_key_value_heads
+		)
+		assert config.num_attention_heads % config.num_key_value_heads == 0, (
+			f'num_attention_heads must be divisible by num_key_value_heads, '
+			f'but got {config.num_attention_heads} and {config.num_key_value_heads}'
+		)
+		self.n_local_heads = config.num_attention_heads
+		self.n_local_kv_heads = config.num_key_value_heads
 		self.n_rep = self.n_local_heads // self.n_local_kv_heads
-		self.head_dim = args.hidden_size // args.num_attention_heads
+		self.head_dim = config.hidden_size // config.num_attention_heads
 		self.q_proj = nn.Linear(
-			args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+			config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
 		)
 		self.k_proj = nn.Linear(
-			args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False
+			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
 		)
 		self.v_proj = nn.Linear(
-			args.hidden_size, args.num_key_value_heads * self.head_dim, bias=False
+			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
 		)
 		self.o_proj = nn.Linear(
-			args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+			config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
 		)
-		self.attn_dropout = nn.Dropout(args.dropout)
-		self.resid_dropout = nn.Dropout(args.dropout)
-		self.dropout = args.dropout
-		self.flash = hasattr(nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+		self.attn_dropout = nn.Dropout(config.dropout)
+		self.resid_dropout = nn.Dropout(config.dropout)
+		self.dropout = config.dropout
+		self.flash = hasattr(nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
 		def forward(
 			self,
@@ -201,9 +208,7 @@ class Attention(nn.Module):
 
 			# 计算位置编码
 			cos, sin = position_embeddings
-			xq, xk = apply_rotary_pos_emb(
-				xq, xk, cos=cos[:seq_len], sin=sin[:seq_len]
-			)
+			xq, xk = apply_rotary_pos_emb(xq, xk, cos=cos[:seq_len], sin=sin[:seq_len])
 
 			# 如果有缓存的 k, v，则进行拼接
 			if past_key_value is not None:
@@ -219,8 +224,11 @@ class Attention(nn.Module):
 			)
 
 			# 计算注意力
-			if self.flash and seq_len > 1 and \
-				(attention_mask is None or torch.all(attention_mask==1)):
+			if (
+				self.flash
+				and seq_len > 1
+				and (attention_mask is None or torch.all(attention_mask == 1))
+			):
 				# 使用 Flash Attention
 				out = F.scaled_dot_product_attention(
 					xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True
@@ -238,11 +246,11 @@ class Attention(nn.Module):
 					extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
 					extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
 					scores = scores + extended_attention_mask
-				
+
 				scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 				scores = self.attn_dropout(scores)
 				out = scores @ xv
-			
+
 			out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
 			out = self.o_proj(out)
 			out = self.resid_dropout(out)
@@ -250,3 +258,273 @@ class Attention(nn.Module):
 			return out, past_kv
 
 
+class FeedForward(nn.Module):
+	def __init__(self, config: MiniMindConfig) -> None:
+		super().__init__()
+		if config.intermediate_size is None:
+			intermediate_size = int(config.hidden_size * 8 / 3)
+			config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+		self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+		self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+		self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+		self.dropout = nn.Dropout(config.dropout)
+		self.act_fn = ACT2FN[config.hidden_act]
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		gate_out = self.gate_proj(x)
+		up_out = self.up_proj(x)
+		hidden_states = self.act_fn(gate_out) * up_out
+		out = self.dropout(self.down_proj(hidden_states))
+		return out
+
+
+class MoEGate(nn.Module):
+	def __init__(self, config: MiniMindConfig) -> None:
+		super().__init__()
+		self.config = config
+
+		self.num_experts_per_tok = config.num_experts_per_tok  # 每个token选择的专家数量
+		self.n_routed_experts = config.n_routed_experts  # 总的专家数量
+		self.n_shared_experts = config.n_shared_experts  # 共享专家
+		self.scoring_func = config.scoring_func  # 评分函数，默认为'softmax'
+		self.aux_loss_alpha = config.aux_loss_alpha  # 辅助损失的alpha参数
+		self.seq_aux = config.seq_aux  # 是否在序列级别上计算辅助损失
+		self.norm_topk_prob = config.norm_topk_prob  # 是否标准化top-k概率
+
+		self.weight = nn.Parameter(torch.empty(self.n_routed_experts, config.hidden_size))
+		self.reset_parameters()
+
+	def reset_parameters(self) -> None:
+		nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+	def forward(
+		self, hidden_states: torch.Tensor
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | float]:
+		batch_size, seq_len, hidden_size = hidden_states.shape
+		hidden_states = hidden_states.view(-1, hidden_size)  # (B*S, H)
+		logits = F.linear(hidden_states, self.weight, None)  # (B*S, n_routed_experts)
+		if self.scoring_func == 'softmax':
+			scores = F.softmax(logits, dim=-1)
+		else:
+			raise NotImplementedError(f'Insupported scoring function: {self.scoring_func}')
+
+		topk_weights, topk_indices = torch.topk(
+			scores, k=self.num_experts_per_tok, dim=-1, sorted=False
+		)
+
+		if self.num_experts_per_tok > 1 and self.norm_topk_prob:
+			denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+			topk_weights = topk_weights / denominator
+
+		# 防止专家坍缩，使用两种把不同的负载均衡方法
+		if self.training and self.aux_loss_alpha > 0.0:
+			scores_for_aux = scores
+			topk_for_aux = self.num_experts_per_tok
+			topk_indices_for_aux_loss = topk_indices.view(batch_size, -1)
+			if self.seq_aux:
+				# 计算序列级别的辅助损失
+				scores_for_seq_aux = scores_for_aux.view(batch_size, seq_len, -1)
+				capacity_estimate = torch.zeros(
+					batch_size, self.n_routed_experts, device=hidden_states.device
+				)
+				capacity_estimate.scatter_add_(
+					1,
+					topk_indices_for_aux_loss,
+					torch.ones(batch_size, seq_len * topk_for_aux, device=hidden_states.device),
+				).div_(seq_len * topk_for_aux / self.n_routed_experts)
+				aux_loss = (capacity_estimate * scores_for_seq_aux.mean(dim=1)).sum(
+					1
+				).mean() * self.aux_loss_alpha
+			else:
+				# 计算token级别的辅助损失
+				mask_capacity_estimate = F.one_hot(
+					topk_indices_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+				)
+				capacity_estimate = mask_capacity_estimate.float().mean(0)
+				Pi = scores_for_aux.mean(0)
+				fi = capacity_estimate * self.n_routed_experts
+				aux_loss = (Pi * fi).sum() * self.aux_loss_alpha
+		else:
+			aux_loss = 0.0
+		return topk_indices, topk_weights, aux_loss
+
+
+class MoeFeedForward(nn.Module):
+	def __init__(self, config: MiniMindConfig) -> None:
+		super().__init__()
+		self.config = config
+		self.experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_routed_experts)])
+		self.gate = MoEGate(config)
+		if config.n_shared_experts > 0:
+			self.shared_experts = nn.ModuleList(
+				[FeedForward(config) for _ in range(config.n_shared_experts)]
+			)
+
+		def forward(self, x: torch.Tensor) -> torch.Tensor:
+			identity = x
+			origin_shape = x.shape  # (B, S, H)
+			batch_size, seq_len, hidden_size = origin_shape
+
+			# 使用门控机制选择专家
+			topk_indices, topk_weights, aux_loss = self.gate(x)  # (B*S, k), (B*S, k), scalar
+			x = x.view(-1, hidden_size)  # (B*S, H)
+			flat_topk_indices = topk_indices.view(-1)  # (B*S*k)
+
+			if self.training:
+				x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # (B*S*k, H)
+				y = torch.empty_like(x, dtype=x.dtype)  # (B*S*k, H)
+				for i, expert in enumerate(self.experts):
+					expert_out = expert(x[flat_topk_indices == i])  # (N_i, H)
+					if expert_out.shape[0] > 0:
+						y[flat_topk_indices == i] = expert_out.to(y.dtype)
+					else:
+						y[flat_topk_indices == i] = expert_out.to(y.dtype) + 0 * sum(
+							p.sum() for p in expert.parameters()
+						)
+				y = (y.view(*topk_weights.shape, -1) * topk_weights.unsqueeze(-1)).sum(
+					dim=1
+				)  # (B*S, H)
+				y = y.view(*origin_shape)  # (B, S, H)
+			else:
+				y = self.moe_infer(x, flat_topk_indices, topk_weights.view(-1)).view(*origin_shape)
+
+			if self.config.n_shared_experts > 0:
+				for expert in self.shared_experts:
+					y = y + expert(identity)
+			self.aux_loss = aux_loss
+			return y
+
+		@torch.no_grad()
+		def moe_infer(
+			self,
+			x: torch.Tensor,
+			flat_expert_indices: torch.Tensor,
+			flat_expert_weights: torch.Tensor,
+		) -> torch.Tensor:
+			expert_cache = torch.zeros_like(x)
+			idxs = flat_expert_indices.argsort()
+			tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+			token_idxs = idxs // self.config.num_experts_per_tok
+			# 当tokens_per_expert = [6, 15, 20, 26]
+			# tokens_per_expert.shape[0]即为专家数量（此时为4）
+			# 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
+			# 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token
+			# （每个token有可能被多个专家处理，这取决于num_experts_per_tok）
+			# 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...
+			# 依此类推
+			for i, end_idx in enumerate(tokens_per_expert):
+				start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+				if start_idx == end_idx:
+					continue
+				expert = self.experts[i]
+				exp_token_idx = token_idxs[start_idx:end_idx]
+				expert_tokens = x[exp_token_idx]
+				expert_out = expert(expert_tokens).to(expert_cache.dtype)
+				expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+				expert_cache.scatter_add_(
+					0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+				)
+
+			return expert_cache
+
+
+class MiniMindBlock(nn.Module):
+	def __init__(self, layer_id: int, config: MiniMindConfig) -> None:
+		super().__init__()
+		self.num_attention_heads = config.num_attention_heads
+		self.hidden_size = config.hidden_size
+		self.head_dim = config.hidden_size // config.num_attention_heads
+		self.attn = Attention(config)
+
+		self.layer_id = layer_id
+		self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		self.mlp = FeedForward(config) if not config.use_moe else MoeFeedForward(config)
+
+	def forward(
+		self,
+		hidden_states: torch.Tensor,
+		position_embeddings: tuple[torch.Tensor, torch.Tensor],
+		past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+		use_cache: bool = False,
+		attention_mask: torch.Tensor | None = None,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+		# 注意力层
+		residual = hidden_states
+		hedden_states, past_key_value = self.attn(
+			self.input_layernorm(hidden_states),
+			position_embeddings,
+			past_key_value,
+			use_cache,
+			attention_mask,
+		)
+		hidden_states = hidden_states + residual
+
+		# 前馈网络层
+		hidden_states = hidden_states + self.mlp(hidden_states)
+
+		return hidden_states, past_key_value
+
+
+class MiniMindModel(nn.Module):
+	def __init__(self, config: MiniMindConfig) -> None:
+		super().__init__()
+		self.config = config
+		self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+		self.dropout = nn.Dropout(config.dropout)
+		self.layers  = nn.ModuleList(
+			[MiniMindBlock(i, config) for i in range(config.num_hidden_layers)]
+		)
+		self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		freqs_cos, freqs_sin = precompute_freqs_cis(
+			dim=config.hidden_size // config.num_attention_heads,
+			end=config.max_position_embeddings,
+			rope_base=config.rope_theta,
+			rope_scaling=config.rope_scaling,
+		)
+		self.freqs_cos : torch.Tensor
+		self.freqs_sin : torch.Tensor
+		self.register_buffer('freqs_cos', freqs_cos, persistent=False)
+		self.register_buffer('freqs_sin', freqs_sin, persistent=False)
+
+	def forward(
+		self,
+		input_ids: torch.Tensor | None = None,
+		attention_mask: torch.Tensor | None = None,
+		past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+		use_cache: bool = False,
+		**kwargs,
+	) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]] | None, torch.Tensor | float]:
+		assert input_ids is not None, 'input_ids must be provided'
+		batch_size, seq_len = input_ids.shape
+		if hasattr(past_key_values, 'layers'):
+			past_key_values = None
+		past_key_values_list = past_key_values or [None] * len(self.layers)
+		start_pos = (
+			past_key_values_list[0][0].shape[1] if past_key_values_list[0] is not None else 0
+		)
+
+		hidden_states = self.dropout(self.embed_tokens(input_ids))
+		position_embeddings = (
+			self.freqs_cos[start_pos : start_pos + seq_len],
+			self.freqs_sin[start_pos : start_pos + seq_len],
+		)
+
+		persents = []
+		for layer, past_key_value in zip(self.layers, past_key_values_list, strict=False):
+			hidden_states, present = layer(
+				hidden_states,
+				position_embeddings,
+				past_key_value,
+				use_cache,
+				attention_mask,
+			)
+			persents.append(present)
+		hidden_states = self.norm(hidden_states)
+
+		aux_loss = sum(
+			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)], # type: ignore
+			hidden_states.new_zeros(1).squeeze(),
+		) # type: ignore
+		return hidden_states, persents, aux_loss
