@@ -3,8 +3,10 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PretrainedConfig
+from transformers import PreTrainedModel as PreTrainModel
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -190,72 +192,72 @@ class Attention(nn.Module):
 		self.dropout = config.dropout
 		self.flash = hasattr(nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-		def forward(
-			self,
-			x: torch.Tensor,
-			position_embeddings: tuple[torch.Tensor, torch.Tensor],
-			past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-			use_cache: bool = False,
-			attention_mask: torch.Tensor | None = None,
-		) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-			batch_size, seq_len, _ = x.shape
+	def forward(
+		self,
+		x: torch.Tensor,
+		position_embeddings: tuple[torch.Tensor, torch.Tensor],
+		past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+		use_cache: bool = False,
+		attention_mask: torch.Tensor | None = None,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+		batch_size, seq_len, _ = x.shape
 
-			# 计算 q, k, v
-			xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-			xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
-			xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
-			xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+		# 计算 q, k, v
+		xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+		xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)
+		xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+		xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
-			# 计算位置编码
-			cos, sin = position_embeddings
-			xq, xk = apply_rotary_pos_emb(xq, xk, cos=cos[:seq_len], sin=sin[:seq_len])
+		# 计算位置编码
+		cos, sin = position_embeddings
+		xq, xk = apply_rotary_pos_emb(xq, xk, cos=cos[:seq_len], sin=sin[:seq_len])
 
-			# 如果有缓存的 k, v，则进行拼接
-			if past_key_value is not None:
-				xk = torch.cat([past_key_value[0], xk], dim=1)
-				xv = torch.cat([past_key_value[1], xv], dim=1)
-			past_kv = (xk, xv) if use_cache else None
+		# 如果有缓存的 k, v，则进行拼接
+		if past_key_value is not None:
+			xk = torch.cat([past_key_value[0], xk], dim=1)
+			xv = torch.cat([past_key_value[1], xv], dim=1)
+		past_kv = (xk, xv) if use_cache else None
 
-			# 交换维度以适应注意力计算
-			xq, xk, xv = (
-				xq.transpose(1, 2),
-				repeat_kv(xk, self.n_rep).transpose(1, 2),
-				repeat_kv(xv, self.n_rep).transpose(1, 2),
+		# 交换维度以适应注意力计算
+		xq, xk, xv = (
+			xq.transpose(1, 2),
+			repeat_kv(xk, self.n_rep).transpose(1, 2),
+			repeat_kv(xv, self.n_rep).transpose(1, 2),
+		)
+
+		# 计算注意力
+		if (
+			self.flash
+			and seq_len > 1
+			and (attention_mask is None or torch.all(attention_mask == 1))
+		):
+			# 使用 Flash Attention
+			out = F.scaled_dot_product_attention(
+				xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True
 			)
+		else:
+			# 使用常规的注意力计算
+			scores = xq @ xk.transpose(-1, -2) / math.sqrt(self.head_dim)
+			scores = scores + torch.triu(
+				torch.full((seq_len, seq_len), float('-inf'), device=scores.device),
+				diagonal=1,
+			).unsqueeze(0).unsqueeze(0)
 
-			# 计算注意力
-			if (
-				self.flash
-				and seq_len > 1
-				and (attention_mask is None or torch.all(attention_mask == 1))
-			):
-				# 使用 Flash Attention
-				out = F.scaled_dot_product_attention(
-					xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True
-				)
-			else:
-				# 使用常规的注意力计算
-				scores = xq @ xk.transpose(-1, -2) / math.sqrt(self.head_dim)
-				scores = scores + torch.triu(
-					torch.full((seq_len, seq_len), float('-inf'), device=scores.device),
-					diagonal=1,
-				).unsqueeze(0).unsqueeze(0)
+			# 扩展的 attention mask
+			if attention_mask is not None:
+				extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+				extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+				scores = scores + extended_attention_mask
 
-				# 扩展的 attention mask
-				if attention_mask is not None:
-					extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-					extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-					scores = scores + extended_attention_mask
+			scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+			scores = self.attn_dropout(scores)
+			out = scores @ xv
 
-				scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-				scores = self.attn_dropout(scores)
-				out = scores @ xv
+		out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
+		out = self.o_proj(out)
+		out = self.resid_dropout(out)
 
-			out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
-			out = self.o_proj(out)
-			out = self.resid_dropout(out)
-
-			return out, past_kv
+		return out, past_kv
 
 
 class FeedForward(nn.Module):
@@ -360,72 +362,72 @@ class MoeFeedForward(nn.Module):
 				[FeedForward(config) for _ in range(config.n_shared_experts)]
 			)
 
-		def forward(self, x: torch.Tensor) -> torch.Tensor:
-			identity = x
-			origin_shape = x.shape  # (B, S, H)
-			batch_size, seq_len, hidden_size = origin_shape
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		identity = x
+		origin_shape = x.shape  # (B, S, H)
+		batch_size, seq_len, hidden_size = origin_shape
 
-			# 使用门控机制选择专家
-			topk_indices, topk_weights, aux_loss = self.gate(x)  # (B*S, k), (B*S, k), scalar
-			x = x.view(-1, hidden_size)  # (B*S, H)
-			flat_topk_indices = topk_indices.view(-1)  # (B*S*k)
+		# 使用门控机制选择专家
+		topk_indices, topk_weights, aux_loss = self.gate(x)  # (B*S, k), (B*S, k), scalar
+		x = x.view(-1, hidden_size)  # (B*S, H)
+		flat_topk_indices = topk_indices.view(-1)  # (B*S*k)
 
-			if self.training:
-				x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # (B*S*k, H)
-				y = torch.empty_like(x, dtype=x.dtype)  # (B*S*k, H)
-				for i, expert in enumerate(self.experts):
-					expert_out = expert(x[flat_topk_indices == i])  # (N_i, H)
-					if expert_out.shape[0] > 0:
-						y[flat_topk_indices == i] = expert_out.to(y.dtype)
-					else:
-						y[flat_topk_indices == i] = expert_out.to(y.dtype) + 0 * sum(
-							p.sum() for p in expert.parameters()
-						)
-				y = (y.view(*topk_weights.shape, -1) * topk_weights.unsqueeze(-1)).sum(
-					dim=1
-				)  # (B*S, H)
-				y = y.view(*origin_shape)  # (B, S, H)
-			else:
-				y = self.moe_infer(x, flat_topk_indices, topk_weights.view(-1)).view(*origin_shape)
+		if self.training:
+			x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # (B*S*k, H)
+			y = torch.empty_like(x, dtype=x.dtype)  # (B*S*k, H)
+			for i, expert in enumerate(self.experts):
+				expert_out = expert(x[flat_topk_indices == i])  # (N_i, H)
+				if expert_out.shape[0] > 0:
+					y[flat_topk_indices == i] = expert_out.to(y.dtype)
+				else:
+					y[flat_topk_indices == i] = expert_out.to(y.dtype) + 0 * sum(
+						p.sum() for p in expert.parameters()
+					)
+			y = (y.view(*topk_weights.shape, -1) * topk_weights.unsqueeze(-1)).sum(
+				dim=1
+			)  # (B*S, H)
+			y = y.view(*origin_shape)  # (B, S, H)
+		else:
+			y = self.moe_infer(x, flat_topk_indices, topk_weights.view(-1)).view(*origin_shape)
 
-			if self.config.n_shared_experts > 0:
-				for expert in self.shared_experts:
-					y = y + expert(identity)
-			self.aux_loss = aux_loss
-			return y
+		if self.config.n_shared_experts > 0:
+			for expert in self.shared_experts:
+				y = y + expert(identity)
+		self.aux_loss = aux_loss
+		return y
 
-		@torch.no_grad()
-		def moe_infer(
-			self,
-			x: torch.Tensor,
-			flat_expert_indices: torch.Tensor,
-			flat_expert_weights: torch.Tensor,
-		) -> torch.Tensor:
-			expert_cache = torch.zeros_like(x)
-			idxs = flat_expert_indices.argsort()
-			tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-			token_idxs = idxs // self.config.num_experts_per_tok
-			# 当tokens_per_expert = [6, 15, 20, 26]
-			# tokens_per_expert.shape[0]即为专家数量（此时为4）
-			# 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
-			# 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token
-			# （每个token有可能被多个专家处理，这取决于num_experts_per_tok）
-			# 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...
-			# 依此类推
-			for i, end_idx in enumerate(tokens_per_expert):
-				start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
-				if start_idx == end_idx:
-					continue
-				expert = self.experts[i]
-				exp_token_idx = token_idxs[start_idx:end_idx]
-				expert_tokens = x[exp_token_idx]
-				expert_out = expert(expert_tokens).to(expert_cache.dtype)
-				expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-				expert_cache.scatter_add_(
-					0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
-				)
+	@torch.no_grad()
+	def moe_infer(
+		self,
+		x: torch.Tensor,
+		flat_expert_indices: torch.Tensor,
+		flat_expert_weights: torch.Tensor,
+	) -> torch.Tensor:
+		expert_cache = torch.zeros_like(x)
+		idxs = flat_expert_indices.argsort()
+		tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+		token_idxs = idxs // self.config.num_experts_per_tok
+		# 当tokens_per_expert = [6, 15, 20, 26]
+		# tokens_per_expert.shape[0]即为专家数量（此时为4）
+		# 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
+		# 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token
+		# （每个token有可能被多个专家处理，这取决于num_experts_per_tok）
+		# 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...
+		# 依此类推
+		for i, end_idx in enumerate(tokens_per_expert):
+			start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+			if start_idx == end_idx:
+				continue
+			expert = self.experts[i]
+			exp_token_idx = token_idxs[start_idx:end_idx]
+			expert_tokens = x[exp_token_idx]
+			expert_out = expert(expert_tokens).to(expert_cache.dtype)
+			expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]].unsqueeze(-1))
+			expert_cache.scatter_add_(
+				0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+			)
 
-			return expert_cache
+		return expert_cache
 
 
 class MiniMindBlock(nn.Module):
@@ -451,17 +453,17 @@ class MiniMindBlock(nn.Module):
 	) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
 		# 注意力层
 		residual = hidden_states
-		hedden_states, past_key_value = self.attn(
+		attn_output, past_key_value = self.attn(
 			self.input_layernorm(hidden_states),
 			position_embeddings,
 			past_key_value,
 			use_cache,
 			attention_mask,
 		)
-		hidden_states = hidden_states + residual
+		hidden_states = residual + attn_output
 
 		# 前馈网络层
-		hidden_states = hidden_states + self.mlp(hidden_states)
+		hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 		return hidden_states, past_key_value
 
@@ -473,7 +475,7 @@ class MiniMindModel(nn.Module):
 		self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
 		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 		self.dropout = nn.Dropout(config.dropout)
-		self.layers  = nn.ModuleList(
+		self.layers = nn.ModuleList(
 			[MiniMindBlock(i, config) for i in range(config.num_hidden_layers)]
 		)
 		self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -483,8 +485,8 @@ class MiniMindModel(nn.Module):
 			rope_base=config.rope_theta,
 			rope_scaling=config.rope_scaling,
 		)
-		self.freqs_cos : torch.Tensor
-		self.freqs_sin : torch.Tensor
+		self.freqs_cos: torch.Tensor
+		self.freqs_sin: torch.Tensor
 		self.register_buffer('freqs_cos', freqs_cos, persistent=False)
 		self.register_buffer('freqs_sin', freqs_sin, persistent=False)
 
@@ -511,7 +513,7 @@ class MiniMindModel(nn.Module):
 			self.freqs_sin[start_pos : start_pos + seq_len],
 		)
 
-		persents = []
+		presents = []
 		for layer, past_key_value in zip(self.layers, past_key_values_list, strict=False):
 			hidden_states, present = layer(
 				hidden_states,
@@ -520,11 +522,50 @@ class MiniMindModel(nn.Module):
 				use_cache,
 				attention_mask,
 			)
-			persents.append(present)
+			presents.append(present)
 		hidden_states = self.norm(hidden_states)
 
 		aux_loss = sum(
-			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)], # type: ignore
+			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)],  # type: ignore
 			hidden_states.new_zeros(1).squeeze(),
-		) # type: ignore
-		return hidden_states, persents, aux_loss
+		)  # type: ignore
+		return hidden_states, presents, aux_loss
+
+
+class MiniMindForCausalLM(PreTrainModel, GenerationMixin):
+	config_class = MiniMindConfig
+
+	def __init__(self, config: MiniMindConfig) -> None:
+		self.config = config or MiniMindConfig()
+		super().__init__(config)
+		self.model = MiniMindModel(config)
+		self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+		self.model.embed_tokens.weight = self.lm_head.weight
+
+	def forward(
+		self,
+		input_ids: torch.Tensor | None = None,
+		attention_mask: torch.Tensor | None = None,
+		past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+		use_cache: bool = False,
+		logits_to_keep: int | torch.Tensor = 1,
+		**kwargs,
+	) -> CausalLMOutputWithPast:
+		hidden_states, past_key_values, aux_loss = self.model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			past_key_values=past_key_values,
+			use_cache=use_cache,
+			**kwargs,
+		)
+		slice_indices = (
+			slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+		)
+		logits = self.lm_head(hidden_states[:, slice_indices, :])
+		output = CausalLMOutputWithPast(
+			logits=logits,
+			past_key_values=past_key_values,  # type: ignore
+			hidden_states=hidden_states,
+		)
+		output.aux_loss = aux_loss
+		return output
