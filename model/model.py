@@ -3,8 +3,10 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PretrainedConfig
+from transformers import PreTrainedModel as PreTrainModel
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -473,7 +475,7 @@ class MiniMindModel(nn.Module):
 		self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
 		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 		self.dropout = nn.Dropout(config.dropout)
-		self.layers  = nn.ModuleList(
+		self.layers = nn.ModuleList(
 			[MiniMindBlock(i, config) for i in range(config.num_hidden_layers)]
 		)
 		self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -483,8 +485,8 @@ class MiniMindModel(nn.Module):
 			rope_base=config.rope_theta,
 			rope_scaling=config.rope_scaling,
 		)
-		self.freqs_cos : torch.Tensor
-		self.freqs_sin : torch.Tensor
+		self.freqs_cos: torch.Tensor
+		self.freqs_sin: torch.Tensor
 		self.register_buffer('freqs_cos', freqs_cos, persistent=False)
 		self.register_buffer('freqs_sin', freqs_sin, persistent=False)
 
@@ -524,7 +526,46 @@ class MiniMindModel(nn.Module):
 		hidden_states = self.norm(hidden_states)
 
 		aux_loss = sum(
-			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)], # type: ignore
+			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)],  # type: ignore
 			hidden_states.new_zeros(1).squeeze(),
-		) # type: ignore
+		)  # type: ignore
 		return hidden_states, persents, aux_loss
+
+
+class MiniMindForCausalLM(PreTrainModel, GenerationMixin):
+	config_class = MiniMindConfig
+
+	def __init__(self, config: MiniMindConfig) -> None:
+		self.config = config or MiniMindConfig()
+		super().__init__(config)
+		self.model = MiniMindModel(config)
+		self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+		self.model.embed_tokens.weight = self.lm_head.weight
+
+	def forward(
+		self,
+		input_ids: torch.Tensor | None = None,
+		attention_mask: torch.Tensor | None = None,
+		past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+		use_cache: bool = False,
+		logits_to_keep: int | torch.Tensor = 1,
+		**kwargs,
+	):
+		hidden_states, past_key_values, aux_loss = self.model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			past_key_values=past_key_values,
+			use_cache=use_cache,
+			**kwargs,
+		)
+		slice_indices = (
+			slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+		)
+		logits = self.lm_head(hidden_states[:, slice_indices, :])
+		output = CausalLMOutputWithPast(
+			logits=logits,
+			past_key_values=past_key_values,  # type: ignore
+			hidden_states=hidden_states,
+		)
+		output.aux_loss = aux_loss
+		return output
