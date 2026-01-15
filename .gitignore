@@ -217,3 +217,7 @@ __marimo__/
 
 
 *.jsonl
+out
+checkpoints
+logs
+images
