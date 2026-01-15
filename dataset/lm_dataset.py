@@ -17,7 +17,7 @@ class PretrainDataset(Dataset):
 	def __len__(self) -> int:
 		return len(self.samples)
 
-	def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
 		sample = self.samples[index]
 
 		# 构建输入文本
@@ -28,11 +28,7 @@ class PretrainDataset(Dataset):
 			truncation=True,
 			return_tensors='pt',
 		)
-		input_ids = encoding['input_ids'].squeeze()
-		loss_mask = (input_ids != self.tokenizer.pad_token_id).long()
-
-		X = torch.tensor(input_ids[:-1], dtype=torch.long)
-		Y = torch.tensor(input_ids[1:], dtype=torch.long)
-		loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
-
-		return X, Y, loss_mask
+		input_ids = encoding.input_ids.squeeze()
+		labels = input_ids.clone()
+		labels[labels == self.tokenizer.pad_token_id] = -100  # 忽略填充部分的损失计算
+		return input_ids, labels

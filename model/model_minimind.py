@@ -42,7 +42,7 @@ class MiniMindConfig(PretrainedConfig):
 		seq_aux: bool = True,
 		norm_topk_prob: bool = True,
 		**kwargs,
-	) -> None:
+	):
 		super().__init__(**kwargs)
 		self.dropout = dropout
 		self.bos_token_id = bos_token_id
@@ -90,7 +90,6 @@ class RMSNorm(torch.nn.Module):
 	def __init__(self, dim: int, eps: float = 1e-5) -> None:
 		super().__init__()
 		self.eps = eps
-		self.dim = dim
 		self.weight = torch.nn.Parameter(torch.ones(dim))
 
 	def _norm(self, x: torch.Tensor) -> torch.Tensor:
@@ -109,8 +108,8 @@ def precompute_freqs_cis(
 		orig_max, factor, beta_fast, beta_slow, attn_factor = (
 			rope_scaling.get('original_max_position_embeddings', 2048),
 			rope_scaling.get('factor', 16),
-			rope_scaling.get('beta_fast', 32),
-			rope_scaling.get('beta_slow', 1),
+			rope_scaling.get('beta_fast', 32.0),
+			rope_scaling.get('beta_slow', 1.0),
 			rope_scaling.get('attention_factor', 1.0),
 		)
 		if end / orig_max > 1.0:
@@ -160,29 +159,26 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-	def __init__(self, config: MiniMindConfig) -> None:
+	def __init__(self, config: MiniMindConfig):
 		super().__init__()
 		self.num_key_value_heads = (
 			config.num_attention_heads
 			if config.num_key_value_heads is None
 			else config.num_key_value_heads
 		)
-		assert config.num_attention_heads % config.num_key_value_heads == 0, (
-			f'num_attention_heads must be divisible by num_key_value_heads, '
-			f'but got {config.num_attention_heads} and {config.num_key_value_heads}'
-		)
+		assert config.num_attention_heads % self.num_key_value_heads == 0
 		self.n_local_heads = config.num_attention_heads
-		self.n_local_kv_heads = config.num_key_value_heads
+		self.n_local_kv_heads = self.num_key_value_heads
 		self.n_rep = self.n_local_heads // self.n_local_kv_heads
 		self.head_dim = config.hidden_size // config.num_attention_heads
 		self.q_proj = nn.Linear(
 			config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
 		)
 		self.k_proj = nn.Linear(
-			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
+			config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
 		)
 		self.v_proj = nn.Linear(
-			config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
+			config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
 		)
 		self.o_proj = nn.Linear(
 			config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
@@ -190,7 +186,10 @@ class Attention(nn.Module):
 		self.attn_dropout = nn.Dropout(config.dropout)
 		self.resid_dropout = nn.Dropout(config.dropout)
 		self.dropout = config.dropout
-		self.flash = hasattr(nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+		self.flash = (
+			hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+		)
+		# print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
 	def forward(
 		self,
@@ -208,11 +207,10 @@ class Attention(nn.Module):
 		xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 		xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
 
-		# 计算位置编码
 		cos, sin = position_embeddings
-		xq, xk = apply_rotary_pos_emb(xq, xk, cos=cos[:seq_len], sin=sin[:seq_len])
+		xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-		# 如果有缓存的 k, v，则进行拼接
+		# kv_cache实现
 		if past_key_value is not None:
 			xk = torch.cat([past_key_value[0], xk], dim=1)
 			xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -225,25 +223,21 @@ class Attention(nn.Module):
 			repeat_kv(xv, self.n_rep).transpose(1, 2),
 		)
 
-		# 计算注意力
 		if (
 			self.flash
-			and seq_len > 1
+			and (seq_len > 1)
+			and (past_key_value is None)
 			and (attention_mask is None or torch.all(attention_mask == 1))
 		):
-			# 使用 Flash Attention
-			out = F.scaled_dot_product_attention(
+			output = F.scaled_dot_product_attention(
 				xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True
 			)
 		else:
-			# 使用常规的注意力计算
-			scores = xq @ xk.transpose(-1, -2) / math.sqrt(self.head_dim)
-			scores = scores + torch.triu(
-				torch.full((seq_len, seq_len), float('-inf'), device=scores.device),
-				diagonal=1,
-			).unsqueeze(0).unsqueeze(0)
+			scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+			scores[:, :, :, -seq_len:] += torch.triu(
+				torch.full((seq_len, seq_len), float('-inf'), device=scores.device), diagonal=1
+			)
 
-			# 扩展的 attention mask
 			if attention_mask is not None:
 				extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
 				extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
@@ -251,13 +245,11 @@ class Attention(nn.Module):
 
 			scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 			scores = self.attn_dropout(scores)
-			out = scores @ xv
+			output = scores @ xv
 
-		out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
-		out = self.o_proj(out)
-		out = self.resid_dropout(out)
-
-		return out, past_kv
+		output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
+		output = self.resid_dropout(self.o_proj(output))
+		return output, past_kv
 
 
 class FeedForward(nn.Module):
@@ -347,7 +339,7 @@ class MoEGate(nn.Module):
 				fi = capacity_estimate * self.n_routed_experts
 				aux_loss = (Pi * fi).sum() * self.aux_loss_alpha
 		else:
-			aux_loss = 0.0
+			aux_loss = scores.new_zeros(1).squeeze()
 		return topk_indices, topk_weights, aux_loss
 
 
@@ -526,9 +518,9 @@ class MiniMindModel(nn.Module):
 		hidden_states = self.norm(hidden_states)
 
 		aux_loss = sum(
-			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)],  # type: ignore
+			[layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoeFeedForward)],
 			hidden_states.new_zeros(1).squeeze(),
-		)  # type: ignore
+		)
 		return hidden_states, presents, aux_loss
 
 
@@ -546,9 +538,10 @@ class MiniMindForCausalLM(PreTrainModel, GenerationMixin):
 		self,
 		input_ids: torch.Tensor | None = None,
 		attention_mask: torch.Tensor | None = None,
+		labels: torch.Tensor | None = None,
 		past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
 		use_cache: bool = False,
-		logits_to_keep: int | torch.Tensor = 1,
+		logits_to_keep: int | torch.Tensor = 0,
 		**kwargs,
 	) -> CausalLMOutputWithPast:
 		hidden_states, past_key_values, aux_loss = self.model(
@@ -562,9 +555,22 @@ class MiniMindForCausalLM(PreTrainModel, GenerationMixin):
 			slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 		)
 		logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+		loss = None
+		if labels is not None:
+			# Shift so that tokens < n predict n
+			shift_logits = logits[..., :-1, :].contiguous()
+			shift_labels = labels[..., 1:].contiguous()
+			loss = F.cross_entropy(
+				shift_logits.view(-1, shift_logits.size(-1)),
+				shift_labels.view(-1),
+				ignore_index=-100,
+			)
+
 		output = CausalLMOutputWithPast(
+			loss=loss,  # type: ignore
 			logits=logits,
-			past_key_values=past_key_values,  # type: ignore
+			past_key_values=past_key_values, # type: ignore
 			hidden_states=hidden_states,
 		)
 		output.aux_loss = aux_loss

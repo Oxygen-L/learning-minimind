@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 
@@ -83,24 +84,20 @@ def lm_checkpoint(
 	resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
 	if model is not None:
-		from torch.nn.parallel import DistributedDataParallel
-
-		state_dict = (
-			model.module.state_dict()
-			if isinstance(model, DistributedDataParallel)
-			else model.state_dict()
-		)
+		raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+		raw_model = getattr(raw_model, '_orig_mod', raw_model)
+		state_dict = raw_model.state_dict()
 		state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-		cpk_tmp = ckp_path + '.tmp'
-		torch.save(state_dict, cpk_tmp)
-		os.replace(cpk_tmp, ckp_path)
+		ckp_tmp = ckp_path + '.tmp'
+		torch.save(state_dict, ckp_tmp)
+		os.replace(ckp_tmp, ckp_path)
 		wandb_id = None
 		if wandb:
-			hasattr(wandb, 'get_run')
-			run = wandb.get_run()
-			wandb_id = getattr(run, 'id', None) if run else None
-		else:
-			wandb_id = getattr(wandb, 'id', None)
+			if hasattr(wandb, 'get_run'):
+				run = wandb.get_run()
+				wandb_id = getattr(run, 'id', None) if run else None
+			else:
+				wandb_id = getattr(wandb, 'id', None)
 
 		resume_data = {
 			'model': state_dict,
@@ -110,14 +107,14 @@ def lm_checkpoint(
 			'world_size': dist.get_world_size() if dist.is_initialized() else 1,
 			'wandb_id': wandb_id,
 		}
-
 		for key, value in kwargs.items():
 			if value is not None:
 				if hasattr(value, 'state_dict'):
-					if isinstance(value, DistributedDataParallel):
-						resume_data[key] = value.module.state_dict()
-					else:
-						resume_data[key] = value.state_dict()
+					raw_value = (
+						value.module if isinstance(value, DistributedDataParallel) else value
+					)
+					raw_value = getattr(raw_value, '_orig_mod', raw_value)
+					resume_data[key] = raw_value.state_dict()
 				else:
 					resume_data[key] = value
 
