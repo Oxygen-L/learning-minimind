@@ -439,6 +439,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "modelscope" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "swanlab" },
@@ -455,6 +456,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=4.4.2" },
+    { name = "modelscope", specifier = ">=1.33.0" },
     { name = "numpy", specifier = ">=2.3.5" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "swanlab", specifier = ">=0.7.6" },
@@ -537,6 +539,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "modelscope"
+version = "1.33.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "requests" },
+    { name = "setuptools" },
+    { name = "tqdm" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d1/02/db35ce865e66fd212fcf0cb5b43db3a3474cf82fae8d835b56ce7dba9247/modelscope-1.33.0.tar.gz", hash = "sha256:5d9ca8eb934cabea236104ed774b3ddf352f96c705272876108aaa25a3bb0b38", size = 4558673, upload-time = "2025-12-10T03:50:01.05Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/86/05/63f01821681b2be5d1739b4aad7b186c28d4ead2c5c99a9fc4aa53c13c19/modelscope-1.33.0-py3-none-any.whl", hash = "sha256:d9bdd566303f813d762e133410007eaf1b78f065c871228ab38640919b707489", size = 6050040, upload-time = "2025-12-10T03:49:58.428Z" },
 ]
 
 [[package]]
