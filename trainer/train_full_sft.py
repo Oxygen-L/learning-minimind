@@ -1,16 +1,17 @@
-import argparse
 import os
 import sys
-import time
-import warnings
-from contextlib import nullcontext
 
 __package__ = 'trainer'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import argparse
+import time
+import warnings
+from contextlib import nullcontext
+
 import torch
 import torch.distributed as dist
-import torch.optim as optim
+from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -218,30 +219,21 @@ if __name__ == '__main__':
 
 	# ========== 8. 开始训练 ==========
 	for epoch in range(start_epoch, args.epochs):
-		train_sampler and train_sampler.set_epoch(epoch)  # type: ignore
-		if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-			batch_sampler = SkipBatchSampler(
-				train_sampler or range(len(train_ds)),  # type: ignore
-				args.batch_size,
-				start_step + 1,
-			)
-			loader = DataLoader(
-				train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True
-			)
+		train_sampler and train_sampler.set_epoch(epoch) # type: ignore
+		setup_seed(42 + epoch)
+		indices = torch.randperm(len(train_ds)).tolist()
+		skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+		batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip) # type: ignore
+		loader = DataLoader(
+			train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True
+		)
+		if skip > 0:
 			Logger(
 				f'Epoch [{epoch + 1}/{args.epochs}]:'
 				f'跳过前{start_step}个step，从step {start_step + 1}开始'
 			)
-			train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-		else:  # 默认从头开始
-			loader = DataLoader(
-				train_ds,
-				batch_size=args.batch_size,
-				shuffle=(train_sampler is None),
-				sampler=train_sampler,
-				num_workers=args.num_workers,
-				pin_memory=True,
-			)
+			train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+		else:
 			train_epoch(epoch, loader, len(loader), 0, wandb)
 
 	# ========== 9. 清理分布进程 ==========

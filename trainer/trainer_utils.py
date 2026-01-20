@@ -1,7 +1,10 @@
-import math
 import os
-import random
 import sys
+
+__package__ = 'trainer'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import math
+import random
 
 import numpy as np
 import torch
@@ -12,21 +15,18 @@ from transformers import AutoTokenizer
 
 from model.model_minimind import MiniMindForCausalLM
 
-__package__ = 'trainer'
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 
 def get_model_params(model, config) -> None:
 	total = sum(p.numel() for p in model.parameters()) / 1e6
 	n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
 	n_active = getattr(config, 'num_experts_per_tok', 0)
 	n_shared = getattr(config, 'n_shared_experts', 0)
-	expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0' in n) / 1e6
-	shared_experts = (
-		sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0' in n) / 1e6
+	expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
+	shared_expert = (
+		sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
 	)
-	base = total - n_routed * expert - n_shared * shared_experts
-	active = base + n_active * expert + n_shared * shared_experts
+	base = total - (expert * n_routed) - (shared_expert * n_shared)
+	active = base + (expert * n_active) + (shared_expert * n_shared)
 	if active < total:
 		Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
 	else:
@@ -37,16 +37,16 @@ def is_main_process() -> bool:
 	return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def Logger(content):
+def Logger(content) -> None:
 	if is_main_process():
 		print(content)
 
 
 def get_lr(current_step, total_steps, lr):
-	return lr * (0.1 * 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
+	return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
 
 
-def init_distributed_mode():
+def init_distributed_mode() -> int:
 	if int(os.environ.get('RANK', -1)) == -1:
 		# 非DDP(分布式)模式
 		return 0
@@ -57,7 +57,7 @@ def init_distributed_mode():
 	return local_rank
 
 
-def setup_seed(seed: int):
+def setup_seed(seed: int) -> None:
 	random.seed(seed)
 	np.random.seed(seed)
 	torch.manual_seed(seed)
@@ -129,7 +129,7 @@ def lm_checkpoint(
 			saved_ws = ckp_data.get('world_size', 1)
 			current_ws = dist.get_world_size() if dist.is_initialized() else 1
 			if saved_ws != current_ws:
-				ckp_data['step'] = ckp_data['step'] * current_ws // saved_ws
+				ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws
 				Logger(f'GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data["step"]}')
 			return ckp_data
 		return None
@@ -149,14 +149,14 @@ def init_model(
 
 	get_model_params(model, lm_config)
 	Logger(
-		f'Trainable Params: {
-			sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M'
+		f'Trainable Params: '
+		f'{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M'
 	)
 	return model.to(device), tokenizer  # type: ignore
 
 
 class SkipBatchSampler(Sampler):
-	def __init__(self, sampler: Sampler, batch_size: int, skip_batches: int) -> None:
+	def __init__(self, sampler: Sampler, batch_size: int, skip_batches: int = 0) -> None:
 		self.sampler = sampler
 		self.batch_size = batch_size
 		self.skip_batches = skip_batches
@@ -176,6 +176,6 @@ class SkipBatchSampler(Sampler):
 		if len(batch) > 0 and skipped >= self.skip_batches:
 			yield batch
 
-	def __len__(self):
+	def __len__(self) -> int:
 		total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore
 		return max(0, total_batches - self.skip_batches)

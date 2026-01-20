@@ -19,23 +19,22 @@ class PretrainDataset(Dataset):
 
 	def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
 		sample = self.samples[index]
-
-		# 构建输入文本
-		encoding = self.tokenizer(
+		tokens = self.tokenizer(
 			str(sample['text']),
-			max_length=self.max_length,
-			padding='max_length',
+			add_special_tokens=False,
+			max_length=self.max_length - 2,
 			truncation=True,
-			return_tensors='pt',
-		)
-		input_ids = encoding.input_ids.squeeze()
+		).input_ids
+		tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+		input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+		input_ids = torch.tensor(input_ids, dtype=torch.long)
 		labels = input_ids.clone()
-		labels[input_ids == self.tokenizer.pad_token_id] = -100  # 忽略填充部分的损失计算
+		labels[input_ids == self.tokenizer.pad_token_id] = -100
 		return input_ids, labels
 
 
 class SFTDataset(Dataset):
-	def __init__(self, jsonl_path, tokenizer, max_length=512) -> None:
+	def __init__(self, jsonl_path, tokenizer, max_length=1024) -> None:
 		super().__init__()
 		self.tokenizer = tokenizer
 		self.max_length = max_length
@@ -90,8 +89,8 @@ class SFTDataset(Dataset):
 		# print(f'\n--- Sample {index} ---')
 		# for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:], strict=True)):
 		# 	print(
-		# 		f'{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> \
-		# 		Y={self.tokenizer.decode([input_ids[i + 1]])!r:16s} label={y}'
+		# 		f'{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> '
+		# 		f'Y={self.tokenizer.decode([input_ids[i + 1]])!r:16s} label={y}'
 		# 	)
 		# # ================
 		return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
