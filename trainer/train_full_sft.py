@@ -1,21 +1,20 @@
+import argparse
 import os
 import sys
-
-__package__ = 'trainer'
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-import argparse
 import time
 import warnings
 from contextlib import nullcontext
 
+__package__ = 'trainer'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 import torch.distributed as dist
-from torch import optim
+import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from dataset.lm_dataset import PretrainDataset
+from dataset.lm_dataset import SFTDataset
 from model.model_minimind import MiniMindConfig
 from trainer.trainer_utils import (
 	Logger,
@@ -65,10 +64,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 			eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 			Logger(
 				f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}),'
-				f'loss: {current_loss:.4f}, '
-				f'logits_loss: {current_logits_loss:.4f}, '
-				f'aux_loss: {current_aux_loss:.4f}, '
-				f'lr: {current_lr:.8f}, '
+				f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, '
+				f'aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, '
 				f'epoch_time: {eta_min:.1f}min'
 			)
 			if wandb:
@@ -95,11 +92,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 				weight=args.save_weight,
 				model=model,
 				optimizer=optimizer,
-				scaler=scaler,
 				epoch=epoch,
 				step=step,
 				wandb=wandb,
 				save_dir='../checkpoints',
+				scaler=scaler,
 			)
 			model.train()
 			del state_dict
@@ -108,14 +105,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='MiniMind Pretraining')
+	parser = argparse.ArgumentParser(description='MiniMind Full SFT')
 	parser.add_argument('--save_dir', type=str, default='../out', help='模型保存目录')
-	parser.add_argument('--save_weight', default='pretrain', type=str, help='保存权重的前缀名')
-	parser.add_argument(
-		'--epochs', type=int, default=1, help='训练轮数（建议1轮zero或2-6轮充分训练）'
-	)
-	parser.add_argument('--batch_size', type=int, default=32, help='batch size')
-	parser.add_argument('--learning_rate', type=float, default=5e-4, help='初始学习率')
+	parser.add_argument('--save_weight', default='full_sft', type=str, help='保存权重的前缀名')
+	parser.add_argument('--epochs', type=int, default=2, help='训练轮数')
+	parser.add_argument('--batch_size', type=int, default=16, help='batch size')
+	parser.add_argument('--learning_rate', type=float, default=1e-6, help='初始学习率')
 	parser.add_argument(
 		'--device',
 		type=str,
@@ -124,7 +119,7 @@ if __name__ == '__main__':
 	)
 	parser.add_argument('--dtype', type=str, default='bfloat16', help='混合精度类型')
 	parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
-	parser.add_argument('--accumulation_steps', type=int, default=8, help='梯度累积步数')
+	parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数')
 	parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值')
 	parser.add_argument('--log_interval', type=int, default=100, help='日志打印间隔')
 	parser.add_argument('--save_interval', type=int, default=1000, help='模型保存间隔')
@@ -137,17 +132,20 @@ if __name__ == '__main__':
 		'--use_moe', default=0, type=int, choices=[0, 1], help='是否使用MoE架构（0=否，1=是）'
 	)
 	parser.add_argument(
-		'--data_path', type=str, default='../dataset/pretrain_hq.jsonl', help='预训练数据路径'
+		'--data_path', type=str, default='../dataset/sft_mini_512.jsonl', help='训练数据路径'
 	)
 	parser.add_argument(
-		'--from_weight', default='none', type=str, help='基于哪个权重训练，为none则从头开始'
+		'--from_weight',
+		default='pretrain',
+		type=str,
+		help='基于哪个权重训练，为none则不基于任何权重训练',
 	)
 	parser.add_argument(
 		'--from_resume', default=0, type=int, choices=[0, 1], help='是否自动检测&续训（0=否，1=是）'
 	)
 	parser.add_argument('--use_wandb', action='store_true', help='是否使用wandb')
 	parser.add_argument(
-		'--wandb_project', type=str, default='MiniMind-Pretrain', help='wandb项目名'
+		'--wandb_project', type=str, default='MiniMind-Full-SFT', help='wandb项目名'
 	)
 	parser.add_argument(
 		'--use_compile',
@@ -190,16 +188,16 @@ if __name__ == '__main__':
 		wandb_id = ckp_data.get('wandb_id') if ckp_data else None
 		resume = 'must' if wandb_id else None
 		wandb_run_name = f'\
-			MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}\
+			MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}\
 		'
-		wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) # type: ignore
+		wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)  # type: ignore
 
 	# ========== 5. 定义模型、数据、优化器 ==========
 	model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 	if args.use_compile == 1:
 		model = torch.compile(model)
 		Logger('torch.compile enabled')
-	train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+	train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 	train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 	scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
 	optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -215,23 +213,23 @@ if __name__ == '__main__':
 
 	# ========== 7. DDP包模型 ==========
 	if dist.is_initialized():
-		model._ddp_params_and_buffers_to_ignore = {'freqs_cos', 'freqs_sin'} # type: ignore
+		model._ddp_params_and_buffers_to_ignore = {'freqs_cos', 'freqs_sin'}  # type: ignore
 		model = DistributedDataParallel(model, device_ids=[local_rank])
 
 	# ========== 8. 开始训练 ==========
 	for epoch in range(start_epoch, args.epochs):
-		train_sampler and train_sampler.set_epoch(epoch) # type: ignore
+		train_sampler and train_sampler.set_epoch(epoch)  # type: ignore
 		if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
 			batch_sampler = SkipBatchSampler(
-				train_sampler or range(len(train_ds)), # type: ignore
-				args.batch_size, 
-				start_step + 1
+				train_sampler or range(len(train_ds)),  # type: ignore
+				args.batch_size,
+				start_step + 1,
 			)
 			loader = DataLoader(
 				train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True
 			)
 			Logger(
-				f'Epoch [{epoch + 1}/{args.epochs}]: '
+				f'Epoch [{epoch + 1}/{args.epochs}]:'
 				f'跳过前{start_step}个step，从step {start_step + 1}开始'
 			)
 			train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
